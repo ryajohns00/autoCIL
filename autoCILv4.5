@@ -1,0 +1,304 @@
+Option Explicit
+
+Sub autoCILv4_5()
+
+    On Error GoTo FailHandler
+
+    Dim masterWB As Workbook: Set masterWB = ThisWorkbook
+    Dim folderPath As String
+    Dim fileList As New Collection
+    Dim filePath As Variant
+    Dim wb As Workbook, ws As Worksheet
+
+    If Not SheetExists_InWB(masterWB, "CIL") Then
+        MsgBox "CIL sheet missing.", vbCritical
+        Exit Sub
+    End If
+
+    folderPath = SelectFolder()
+    If folderPath = "" Then Exit Sub
+
+    GetAllExcelFiles folderPath, fileList
+    If fileList.Count = 0 Then
+        MsgBox "No Excel files found.", vbExclamation
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.DisplayAlerts = False
+    Application.EnableEvents = False
+    Application.Calculation = xlCalculationManual
+
+    For Each filePath In fileList
+
+        Set wb = Workbooks.Open(filePath, ReadOnly:=True, UpdateLinks:=False)
+
+        For Each ws In wb.Worksheets
+            Dim pnCol As Long, revCol As Long, headerRow As Long
+            If FindTraceColumnsByHeader(ws, pnCol, revCol, headerRow) Then
+                Run_Check_TraceSheet masterWB, ws, pnCol, revCol, headerRow
+            End If
+        Next ws
+
+        wb.Close False
+    Next filePath
+
+    MsgBox "autoCIL v4.5 complete.", vbInformation
+
+CleanExit:
+    Application.ScreenUpdating = True
+    Application.DisplayAlerts = True
+    Application.EnableEvents = True
+    Application.Calculation = xlCalculationAutomatic
+    Exit Sub
+
+FailHandler:
+    MsgBox "Error: " & Err.Description, vbCritical
+    Resume CleanExit
+End Sub
+
+
+Sub Run_Check_TraceSheet(masterWB As Workbook, traceWS As Worksheet, _
+                         pnCol As Long, revCol As Long, headerRow As Long)
+
+    Dim dict As Object
+    Set dict = BuildTraceDict(traceWS, pnCol, revCol, headerRow)
+
+    Dim wsCIL As Worksheet: Set wsCIL = masterWB.Sheets("CIL")
+    Dim lastRow As Long: lastRow = wsCIL.Cells(wsCIL.Rows.Count, "A").End(xlUp).Row
+    Dim startRow As Long: startRow = GetCILStartRow(masterWB)
+
+    Dim r As Long, pn As String, rv As String
+    Dim baseline As String, finalRev As String
+
+    For r = startRow To lastRow
+
+        pn = Trim(wsCIL.Range("A" & r).Text)
+        If IsPartNumber(pn) Then
+
+            If dict.Exists(pn) Then
+                rv = CleanRev(dict(pn))
+                baseline = CleanRev(wsCIL.Range("D" & r).Text)
+
+                If Not IsValidRev(wsCIL.Range("E" & r).Text) Then
+                    wsCIL.Range("E" & r).Value = rv
+                Else
+                    If baseline <> rv Then
+                        If baseline = "" Then
+                            finalRev = rv
+                        Else
+                            finalRev = baseline & "," & rv
+                        End If
+                        wsCIL.Range("E" & r).Value = finalRev
+                    End If
+                End If
+
+                wsCIL.Range("E" & r).HorizontalAlignment = xlCenter
+                wsCIL.Range("E" & r).VerticalAlignment = xlCenter
+            End If
+
+        End If
+    Next r
+End Sub
+
+
+Function BuildTraceDict(ws As Worksheet, pnCol As Long, revCol As Long, headerRow As Long) As Object
+
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+
+    Dim dataStart As Long: dataStart = headerRow + 1
+    Dim lastRow As Long: lastRow = ws.Cells(ws.Rows.Count, pnCol).End(xlUp).Row
+    If lastRow < dataStart Then
+        Set BuildTraceDict = dict
+        Exit Function
+    End If
+
+    Dim pnArr As Variant, revArr As Variant
+    pnArr = ws.Range(ws.Cells(dataStart, pnCol), ws.Cells(lastRow, pnCol)).Value
+    revArr = ws.Range(ws.Cells(dataStart, revCol), ws.Cells(lastRow, revCol)).Value
+
+    Dim i As Long, pn As String, rv As String
+
+    For i = 1 To UBound(pnArr, 1)
+        pn = Trim(CStr(pnArr(i, 1)))
+        rv = Trim(CStr(revArr(i, 1)))
+
+        If pn <> "" And IsValidRev(rv) Then
+            If Not dict.Exists(pn) Then dict.Add pn, rv
+        End If
+    Next i
+
+    Set BuildTraceDict = dict
+End Function
+
+
+Function FindTraceColumnsByHeader(ws As Worksheet, ByRef pnCol As Long, _
+                                  ByRef revCol As Long, ByRef headerRow As Long) As Boolean
+
+    Dim r As Long, c As Long, txt As String
+    Dim lastCol As Long
+
+    pnCol = 0: revCol = 0: headerRow = 0
+    lastCol = Application.Min(ws.Cells(1, ws.Columns.Count).End(xlToLeft).Column, 60)
+
+    For r = 1 To 15
+        For c = 1 To lastCol
+
+            txt = UCase(Trim(ws.Cells(r, c).Text))
+
+            If pnCol = 0 Then
+                If txt Like "*PART NUMBER*" Or txt Like "*PART NO*" Or txt = "PN" _
+                Or txt Like "*ITEM*" Or txt Like "*IDENTIFICATION NUMBER*" Then
+                    pnCol = c
+                    headerRow = r
+                End If
+            End If
+
+            If revCol = 0 Then
+                If txt = "REV" Or txt Like "*REVISION*" Or txt Like "*REV LEVEL*" Or txt Like "*VERSION*" Then
+                    revCol = c
+                    If headerRow = 0 Then headerRow = r
+                End If
+            End If
+
+            If pnCol > 0 And revCol > 0 Then
+                FindTraceColumnsByHeader = True
+                Exit Function
+            End If
+        Next c
+    Next r
+
+    FindTraceColumnsByHeader = False
+End Function
+
+
+Function GetCILStartRow(masterWB As Workbook) As Long
+
+    Dim ws As Worksheet: Set ws = masterWB.Sheets("CIL")
+    Dim lastRow As Long: lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+    Dim r As Long, t As String
+
+    For r = 1 To Application.Min(lastRow, 200)
+        t = UCase(Trim(ws.Range("A" & r).Text))
+        If t Like "*IDENTIFICATION NUMBER*" Or t Like "*PART NUMBER*" _
+        Or t Like "*ITEM NUMBER*" Or t Like "*CONFIGURATION IDENTIFICATION LIST*" Then
+            GetCILStartRow = r + 1
+            Exit Function
+        End If
+    Next r
+
+    For r = 1 To lastRow
+        t = Trim(ws.Range("A" & r).Text)
+        If IsPartNumber(t) Then
+            GetCILStartRow = r
+            Exit Function
+        End If
+    Next r
+
+    GetCILStartRow = 12
+End Function
+
+
+Function IsPartNumber(s As String) As Boolean
+    Dim t As String: t = Trim(s)
+    If t = "" Then Exit Function
+
+    If InStr(1, t, "PART NUMBER", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, t, "IDENTIFICATION", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, t, "CONFIGURATION", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, t, "CONTRACT", vbTextCompare) > 0 Then Exit Function
+    If InStr(1, t, "PROGRAM", vbTextCompare) > 0 Then Exit Function
+
+    If t Like "*[0-9]*" And Len(t) >= 4 Then IsPartNumber = True
+End Function
+
+
+Function IsValidRev(s As String) As Boolean
+    Dim t As String: t = LCase(Trim(s))
+    If t = "" Then Exit Function
+    If t = "no data available" Then Exit Function
+    If t = ",no data available" Then Exit Function
+    IsValidRev = True
+End Function
+
+
+Function CleanRev(s As String) As String
+    Dim t As String: t = Trim(s)
+    If LCase(t) = "no data available" Then t = ""
+    If LCase(t) = ",no data available" Then t = ""
+    CleanRev = t
+End Function
+
+
+Function isMacOS() As Boolean
+    isMacOS = (InStr(1, Application.OperatingSystem, "Mac", vbTextCompare) > 0)
+End Function
+
+
+Function SelectFolder() As String
+
+    If isMacOS() Then
+
+        On Error GoTo AppleFallback
+
+        Dim dialog As Object
+        Set dialog = Application.FileDialog(msoFileDialogFolderPicker)
+
+        If Not dialog Is Nothing Then
+            dialog.AllowMultiSelect = False
+            dialog.Title = "Select Trace Folder"
+            If dialog.Show = -1 Then
+                SelectFolder = dialog.SelectedItems(1)
+                Exit Function
+            End If
+        End If
+
+AppleFallback:
+        On Error Resume Next
+        Dim script As String
+        script = "POSIX path of (choose folder with prompt ""Select Trace Folder"")"
+        SelectFolder = MacScript(script)
+        If Err.Number <> 0 Then SelectFolder = ""
+        On Error GoTo 0
+
+    Else
+
+        Dim fd As FileDialog
+        Set fd = Application.FileDialog(msoFileDialogFolderPicker)
+        fd.AllowMultiSelect = False
+        fd.Title = "Select Trace Folder"
+        If fd.Show = -1 Then
+            SelectFolder = fd.SelectedItems(1)
+        Else
+            SelectFolder = ""
+        End If
+
+    End If
+End Function
+
+
+Sub GetAllExcelFiles(folderPath As String, fileList As Collection)
+    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+    Dim folder As Object: Set folder = fso.GetFolder(folderPath)
+    Dim file As Object, subFolder As Object
+
+    For Each file In folder.Files
+        Select Case LCase(fso.GetExtensionName(file.Name))
+            Case "xlsx", "xlsm", "xls"
+                fileList.Add file.Path
+        End Select
+    Next file
+
+    For Each subFolder In folder.SubFolders
+        GetAllExcelFiles subFolder.Path, fileList
+    Next subFolder
+End Sub
+
+
+Function SheetExists_InWB(wb As Workbook, sheetName As String) As Boolean
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Sheets(sheetName)
+    SheetExists_InWB = Not ws Is Nothing
+    On Error GoTo 0
+End Function
