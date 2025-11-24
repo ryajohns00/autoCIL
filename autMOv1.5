@@ -1,0 +1,373 @@
+ion Explicit
+
+' ============================================================
+' autoMO_v1.5 — FINAL
+'
+' MASTER SHEET:
+' - Descriptions / PNs can be nested across MULTIPLE columns.
+' - PN is last (...) group in a description cell.
+' - SN and MO columns move between sheets.
+' -> We detect SN/MO columns by header text across top rows.
+'
+' TRACE FILES:
+' - Filename begins with PN (exact prefix match).
+' - Filename contains SN token ("SN", "S/N", "SER", "SERIAL").
+' - MO(s) are in trace Column A and start with "2MO".
+'
+' HIGHLIGHTS:
+' - Missing trace: MO cell yellow
+' - Multiple distinct MOs: MO cell red + comma-separated list
+' ============================================================
+
+Public Sub Run_autoMO_v1_5()
+
+On Error GoTo FailHandler
+
+Dim masterWB As Workbook: Set masterWB = ThisWorkbook
+Dim ws As Worksheet: Set ws = masterWB.Worksheets("MO") '<< change if needed
+
+' ===== CONFIG =====
+Const HEADER_SCAN_ROWS As Long = 30
+Const FIRST_DATA_ROW_MIN As Long = 2
+Const MO_PREFIX As String = "2MO"
+
+Const DEFAULT_SN_COL As Long = 6 'F fallback only if nothing else works
+Const DEFAULT_MO_COL As Long = 7 'G fallback only if nothing else works
+
+' highlight colors
+Const YELLOW_R As Long = 255, YELLOW_G As Long = 255, YELLOW_B As Long = 153
+Const REDFILL_R As Long = 255, REDFILL_G As Long = 199, REDFILL_B As Long = 206
+Const REDFONT_R As Long = 156, REDFONT_G As Long = 0, REDFONT_B As Long = 6
+' ==================
+
+Application.ScreenUpdating = False
+Application.DisplayAlerts = False
+Application.EnableEvents = False
+
+' 1) Detect SN/MO columns by headers (robust, across full used width)
+Dim snCol As Long, moCol As Long, headerRow As Long
+DetectSNMOColumns_Robust ws, HEADER_SCAN_ROWS, snCol, moCol, headerRow
+
+' Fallback rules if headers truly not found
+If moCol = 0 Then moCol = DEFAULT_MO_COL
+If snCol = 0 Then
+If moCol > 1 Then
+snCol = moCol - 1 'best guess: SN sits next to MO
+Else
+snCol = DEFAULT_SN_COL
+End If
+End If
+If headerRow = 0 Then headerRow = 1
+
+Dim firstRow As Long
+firstRow = Application.Max(FIRST_DATA_ROW_MIN, headerRow + 1)
+
+' 2) Determine scan bounds
+Dim lastRow As Long, lastCol As Long
+lastRow = ws.UsedRange.Rows(ws.UsedRange.Rows.Count).Row
+lastCol = ws.UsedRange.Columns(ws.UsedRange.Columns.Count).Column
+
+If lastRow < firstRow Then GoTo CleanExit
+
+' 3) Pick trace folder
+Dim folderPath As String
+folderPath = PickFolder()
+If folderPath = "" Then GoTo CleanExit
+
+' 4) Scan ALL cells for PNs in parentheses -> PN -> row
+Dim pnToRow As Object: Set pnToRow = CreateObject("Scripting.Dictionary")
+Dim r As Long, c As Long
+Dim txt As String, pnStr As String
+
+For r = firstRow To lastRow
+For c = 1 To lastCol
+txt = Trim(CStr(ws.Cells(r, c).Value))
+If InStr(txt, "(") > 0 And InStr(txt, ")") > 0 Then
+pnStr = ExtractPN_FromDescription(txt)
+If LooksLikePN(pnStr) Then
+If Not pnToRow.Exists(pnStr) Then pnToRow.Add pnStr, r
+End If
+End If
+Next c
+Next r
+
+If pnToRow.Count = 0 Then
+MsgBox "autoMO_v1.5: No part numbers found in sheet text.", vbExclamation
+GoTo CleanExit
+End If
+
+' 5) Index trace files by filename PN prefix (no opens)
+Dim traceIndex As Object: Set traceIndex = CreateObject("Scripting.Dictionary")
+Dim files As Collection: Set files = GetExcelFilesRecursive(folderPath)
+Dim fp As Variant, tracePN As String
+
+For Each fp In files
+tracePN = PartNumberFromFilename(CStr(fp))
+If tracePN <> "" Then
+If Not traceIndex.Exists(tracePN) Then traceIndex.Add tracePN, CStr(fp)
+End If
+Next fp
+
+' 6) Loop PNs, open matching trace, fill SN/MO
+Dim pn As Variant
+Dim rowNum As Long, traceFile As String
+Dim snVal As String, moText As String
+Dim traceWB As Workbook, traceWS As Worksheet
+
+For Each pn In pnToRow.Keys
+
+pnStr = CStr(pn)
+rowNum = pnToRow(pnStr)
+
+If Not traceIndex.Exists(pnStr) Then
+' Missing trace -> yellow highlight on MO cell if blank
+With ws.Cells(rowNum, moCol)
+If Trim(CStr(.Value)) = "" Then .Interior.Color = RGB(YELLOW_R, YELLOW_G, YELLOW_B)
+End With
+GoTo NextPN
+End If
+
+traceFile = traceIndex(pnStr)
+
+' SN from filename (robust tokens + strip to first digit)
+snVal = SerialFromFilename(traceFile, pnStr)
+
+' MO(s) from trace Column A
+Set traceWB = Workbooks.Open(traceFile, ReadOnly:=True)
+Set traceWS = FirstVisibleSheet(traceWB)
+
+moText = ""
+If Not traceWS Is Nothing Then
+moText = ExtractMOsFromColumnA(traceWS, MO_PREFIX)
+End If
+
+traceWB.Close SaveChanges:=False
+
+' Write SN if blank
+If Trim(CStr(ws.Cells(rowNum, snCol).Value)) = "" Then
+ws.Cells(rowNum, snCol).Value = snVal
+End If
+
+' Write MO if blank
+If Trim(CStr(ws.Cells(rowNum, moCol).Value)) = "" Then
+ws.Cells(rowNum, moCol).Value = moText
+End If
+
+' Multi-MO -> red highlight
+If InStr(1, moText, ",") > 0 Then
+With ws.Cells(rowNum, moCol)
+.Interior.Color = RGB(REDFILL_R, REDFILL_G, REDFILL_B)
+.Font.Color = RGB(REDFONT_R, REDFONT_G, REDFONT_B)
+End With
+End If
+
+NextPN:
+Next pn
+
+CleanExit:
+Application.ScreenUpdating = True
+Application.DisplayAlerts = True
+Application.EnableEvents = True
+MsgBox "autoMO_v1.5 complete.", vbInformation
+Exit Sub
+
+FailHandler:
+MsgBox "autoMO_v1.5 error: " & Err.Description, vbCritical
+Resume CleanExit
+
+End Sub
+
+
+' ==========================================================
+' Robust SN/MO header detection across full used width
+' ==========================================================
+Private Sub DetectSNMOColumns_Robust(ws As Worksheet, scanRows As Long, _
+ByRef snCol As Long, ByRef moCol As Long, ByRef headerRow As Long)
+
+Dim r As Long, c As Long
+Dim lastCol As Long
+Dim txt As String
+
+snCol = 0: moCol = 0: headerRow = 0
+
+For r = 1 To scanRows
+
+lastCol = ws.UsedRange.Columns(ws.UsedRange.Columns.Count).Column
+If lastCol < 1 Then GoTo NextRow
+
+For c = 1 To lastCol
+txt = LCase(Trim(CStr(ws.Cells(r, c).Value)))
+
+If snCol = 0 Then
+If txt Like "*serial number*" Or txt Like "*serial*" Or txt Like "*s/n*" _
+Or txt Like "*sn*" Then
+snCol = c: headerRow = r
+End If
+End If
+
+If moCol = 0 Then
+If txt Like "*manufacturing order*" Or txt Like "*mfg order*" _
+Or (txt Like "*mo*" And Not txt Like "*model*") Then
+moCol = c: headerRow = r
+End If
+End If
+
+If snCol > 0 And moCol > 0 Then Exit Sub
+Next c
+
+NextRow:
+Next r
+End Sub
+
+
+' ==========================================================
+' Extract PN as LAST (...) group in description text
+' Example: "SLS CCA, SRM (HPUC) (688640-401)" -> 688640-401
+' ==========================================================
+Private Function ExtractPN_FromDescription(ByVal s As String) As String
+Dim p1 As Long, p2 As Long
+p2 = InStrRev(s, ")")
+If p2 = 0 Then ExtractPN_FromDescription = "": Exit Function
+p1 = InStrRev(s, "(", p2)
+If p1 = 0 Then ExtractPN_FromDescription = "": Exit Function
+ExtractPN_FromDescription = Trim(Mid(s, p1 + 1, p2 - p1 - 1))
+End Function
+
+' Filter so we don’t treat "(HPUC)" as a PN
+Private Function LooksLikePN(ByVal s As String) As Boolean
+Dim hasDigit As Boolean, hasDash As Boolean
+Dim i As Long, ch As String
+
+hasDigit = False
+hasDash = (InStr(s, "-") > 0)
+
+For i = 1 To Len(s)
+ch = Mid(s, i, 1)
+If ch Like "#" Then hasDigit = True: Exit For
+Next i
+
+LooksLikePN = (Len(s) >= 5 And hasDigit And hasDash)
+End Function
+
+
+' ==========================================================
+' SN from filename (handles SN / S/N / SER / SERIAL)
+' strips to first digit to avoid leading "S"
+' ==========================================================
+Private Function SerialFromFilename(ByVal fullPath As String, Optional ByVal pnStr As String = "") As String
+Dim baseName As String, p As Long, tail As String, i As Long
+baseName = FileBaseName(fullPath)
+
+p = InStr(1, baseName, "SN", vbTextCompare)
+If p = 0 Then p = InStr(1, baseName, "S/N", vbTextCompare)
+If p = 0 Then p = InStr(1, baseName, "SERIAL", vbTextCompare)
+If p = 0 Then p = InStr(1, baseName, "SER", vbTextCompare)
+
+If p > 0 Then
+tail = Mid(baseName, p)
+tail = Replace(tail, "S/N", "SN", 1, -1, vbTextCompare)
+p = InStr(1, tail, "SN", vbTextCompare)
+tail = Mid(tail, p + 2)
+ElseIf pnStr <> "" Then
+p = InStr(1, baseName, pnStr, vbTextCompare)
+If p > 0 Then tail = Mid(baseName, p + Len(pnStr)) Else tail = baseName
+Else
+tail = baseName
+End If
+
+tail = Replace(tail, "-", " ")
+tail = Replace(tail, "_", " ")
+tail = Trim(tail)
+
+For i = 1 To Len(tail)
+If Mid(tail, i, 1) Like "#" Then
+SerialFromFilename = Mid(tail, i)
+Exit Function
+End If
+Next i
+
+SerialFromFilename = ""
+End Function
+
+
+' ==========================================================
+' TRACE: MO extraction from Column A ("2MO*")
+' ==========================================================
+Private Function ExtractMOsFromColumnA(ws As Worksheet, prefix As String) As String
+Dim lastRow As Long: lastRow = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row
+Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+Dim r As Long, v As String, k As String
+
+For r = 1 To lastRow
+v = Trim(CStr(ws.Cells(r, 1).Value))
+If Len(v) > 0 And UCase(Left(v, Len(prefix))) = UCase(prefix) Then
+k = LCase(v)
+If Not dict.Exists(k) Then dict.Add k, v
+End If
+Next r
+
+ExtractMOsFromColumnA = JoinDictValues(dict, ", ")
+End Function
+
+
+' ==========================================================
+' File / sheet helpers
+' ==========================================================
+Private Function PartNumberFromFilename(ByVal fullPath As String) As String
+Dim fName As String, baseName As String, tokens() As String
+fName = Mid(fullPath, InStrRev(fullPath, "\") + 1)
+baseName = Left(fName, InStrRev(fName, ".") - 1)
+tokens = Split(baseName, " ")
+If UBound(tokens) >= 0 Then PartNumberFromFilename = Trim(tokens(0)) Else PartNumberFromFilename = ""
+End Function
+
+Private Function FirstVisibleSheet(wb As Workbook) As Worksheet
+Dim ws As Worksheet
+For Each ws In wb.Worksheets
+If ws.Visible = xlSheetVisible Then Set FirstVisibleSheet = ws: Exit Function
+Next ws
+Set FirstVisibleSheet = Nothing
+End Function
+
+Private Function FileBaseName(ByVal fullPath As String) As String
+Dim fName As String
+fName = Mid(fullPath, InStrRev(fullPath, "\") + 1)
+FileBaseName = Left(fName, InStrRev(fName, ".") - 1)
+End Function
+
+Private Function PickFolder() As String
+Dim fd As FileDialog
+Set fd = Application.FileDialog(msoFileDialogFolderPicker)
+With fd
+.Title = "Select folder containing trace files"
+.AllowMultiSelect = False
+If .Show <> -1 Then PickFolder = "" Else PickFolder = .SelectedItems(1)
+End With
+End Function
+
+Private Function GetExcelFilesRecursive(ByVal rootPath As String) As Collection
+Dim col As New Collection, fso As Object, folder As Object
+Set fso = CreateObject("Scripting.FileSystemObject")
+Set folder = fso.GetFolder(rootPath)
+AddFilesFromFolder folder, col, fso
+Set GetExcelFilesRecursive = col
+End Function
+
+Private Sub AddFilesFromFolder(ByVal folder As Object, ByRef col As Collection, ByVal fso As Object)
+Dim file As Object, subFolder As Object, ext As String
+For Each file In folder.Files
+ext = LCase(fso.GetExtensionName(file.Path))
+If ext = "xlsx" Or ext = "xlsm" Or ext = "xls" Then col.Add file.Path
+Next file
+For Each subFolder In folder.SubFolders
+AddFilesFromFolder subFolder, col, fso
+Next subFolder
+End Sub
+
+Private Function JoinDictValues(dict As Object, delim As String) As String
+Dim k As Variant, s As String
+If dict Is Nothing Or dict.Count = 0 Then JoinDictValues = "": Exit Function
+For Each k In dict.Keys: s = s & dict(k) & delim: Next k
+If Len(s) > 0 Then s = Left(s, Len(s) - Len(delim))
+JoinDictValues = s
+End Function
