@@ -1,177 +1,210 @@
-Option Explicit
+tion Explicit
 
 ' ============================================================
-' autoCIL v2 — Direct scan (no sheet import)
-' I scan every Excel file in a chosen folder (and subfolders),
-' find trace-like sheets, and pull revs into THIS workbook’s CIL.
+' autoCIL v4 — Direct scan + dictionary + lock-file hardening
+' I scan trace files in a folder tree, build a part→rev map
+' from trace-like sheets, then update THIS workbook’s CIL.
+' v4 fixes Excel "~$" lock files and safe-opens unreadable files.
 ' ============================================================
-Public Sub autoCILv2_BuildCIL_FromTraceFiles()
+Public Sub autoCILv4_BuildCIL_FromTraceFiles()
 
-    On Error GoTo FailHandler
+On Error GoTo FailHandler
 
-    Dim masterWB As Workbook
-    Dim folderPath As String
-    Dim fileList As Collection
-    Dim filePath As Variant
-    Dim wb As Workbook
-    Dim ws As Worksheet
+Dim masterWB As Workbook
+Dim folderPath As String
+Dim fileList As Collection
+Dim filePath As Variant
+Dim wb As Workbook
+Dim ws As Worksheet
 
-    Set masterWB = ThisWorkbook
+Set masterWB = ThisWorkbook
 
-    Application.ScreenUpdating = False
-    Application.DisplayAlerts = False
-    Application.EnableEvents = False
+Application.ScreenUpdating = False
+Application.DisplayAlerts = False
+Application.EnableEvents = False
 
-    ' I must have a CIL sheet in the master
-    If Not autoCILv2_SheetExists(masterWB, "CIL") Then
-        MsgBox "ERROR: No CIL sheet in master workbook.", vbCritical
-        GoTo CleanExit
-    End If
+' I must have a CIL sheet in the master
+If Not autoCILv4_SheetExists(masterWB, "CIL") Then
+MsgBox "ERROR: No CIL sheet found in this workbook.", vbCritical
+GoTo CleanExit
+End If
 
-    folderPath = autoCILv2_SelectFolder()
-    If folderPath = "" Then GoTo CleanExit
+folderPath = autoCILv4_SelectFolder()
+If folderPath = "" Then GoTo CleanExit
 
-    Set fileList = New Collection
-    autoCILv2_GetAllExcelFiles folderPath, fileList
+Set fileList = New Collection
+autoCILv4_GetAllExcelFiles folderPath, fileList
 
-    ' I loop every workbook I found
-    For Each filePath In fileList
+' I loop through every workbook I found
+For Each filePath In fileList
 
-        Set wb = Workbooks.Open(CStr(filePath), ReadOnly:=True, UpdateLinks:=False)
+Set wb = Nothing
+On Error Resume Next
+Set wb = Workbooks.Open( _
+Filename:=CStr(filePath), _
+ReadOnly:=True, _
+UpdateLinks:=False, _
+Notify:=False)
+On Error GoTo 0
 
-        ' I only process trace-like sheets
-        For Each ws In wb.Worksheets
-            If autoCILv2_IsTraceLikeSheet(ws) Then
-                autoCILv2_ProcessOneTraceSheet masterWB, ws
-            End If
-        Next ws
+' If it truly can’t open, I skip it and keep going
+If wb Is Nothing Then GoTo NextFile
 
-        wb.Close SaveChanges:=False
-    Next filePath
+' I only process trace-like sheets
+For Each ws In wb.Worksheets
+If autoCILv4_IsTraceLikeSheet(ws) Then
+autoCILv4_ProcessOneTraceSheet_Dict masterWB, ws
+End If
+Next ws
 
-    MsgBox "CIL build complete — processed " & fileList.Count & " workbooks.", vbInformation
+wb.Close SaveChanges:=False
+
+NextFile:
+Next filePath
+
+MsgBox "CIL build complete — processed " & fileList.Count & " workbooks.", vbInformation
 
 CleanExit:
-    Application.EnableEvents = True
-    Application.DisplayAlerts = True
-    Application.ScreenUpdating = True
-    Exit Sub
+Application.EnableEvents = True
+Application.DisplayAlerts = True
+Application.ScreenUpdating = True
+Exit Sub
 
 FailHandler:
-    MsgBox "ERROR: " & Err.Description, vbCritical
-    Resume CleanExit
+MsgBox "ERROR: " & Err.Description, vbCritical
+Resume CleanExit
 
 End Sub
 
 
 ' ============================================================
-' I process one trace worksheet from an external workbook.
-' I match part numbers and write revs into the master CIL.
+' I process one trace sheet using a dictionary for speed.
+' I build part→first valid rev, then update CIL using D/E rules.
 ' ============================================================
-Private Sub autoCILv2_ProcessOneTraceSheet(masterWB As Workbook, traceWS As Worksheet)
+Private Sub autoCILv4_ProcessOneTraceSheet_Dict(masterWB As Workbook, traceWS As Worksheet)
 
-    Dim pnumber As String, tracePN As String
-    Dim rev As String, existingRev As String, newRev As String
-    Dim rowNum As Long, traceRow As Long
-    Dim cilLastRow As Long, traceLastRow As Long, startRow As Long
+Dim dict As Object
+Set dict = autoCILv4_BuildTraceDict_FirstValidRev(traceWS)
 
-    cilLastRow = masterWB.Sheets("CIL").Cells(masterWB.Sheets("CIL").Rows.Count, "A").End(xlUp).Row
-    traceLastRow = traceWS.Cells(traceWS.Rows.Count, "B").End(xlUp).Row
-    startRow = autoCILv2_GetCILStartRow(masterWB)
+Dim pnumber As String
+Dim rev As String
+Dim baselineRev As String
+Dim newRev As String
+Dim rowNum As Long
+Dim cilLastRow As Long
+Dim startRow As Long
 
-    For rowNum = startRow To cilLastRow
+cilLastRow = masterWB.Sheets("CIL").Cells(masterWB.Sheets("CIL").Rows.Count, "A").End(xlUp).Row
+startRow = autoCILv4_GetCILStartRow(masterWB)
 
-        pnumber = masterWB.Sheets("CIL").Range("A" & rowNum).Text
+For rowNum = startRow To cilLastRow
 
-        If autoCILv2_IsPartNumber(pnumber) Then
+pnumber = masterWB.Sheets("CIL").Range("A" & rowNum).Text
 
-            traceRow = 5
+If autoCILv4_IsPartNumber(pnumber) Then
 
-            Do While traceRow <= traceLastRow
+If dict.Exists(pnumber) Then
+rev = dict(pnumber)
 
-                tracePN = traceWS.Range("B" & traceRow).Text
+' If CIL E is empty, I write the rev
+If Not autoCILv4_IsValidRev(masterWB.Sheets("CIL").Range("E" & rowNum).Text) Then
 
-                If tracePN = pnumber Then
+masterWB.Sheets("CIL").Range("E" & rowNum).Value = autoCILv4_CleanRev(rev)
+autoCILv4_CenterCell masterWB.Sheets("CIL").Range("E" & rowNum)
 
-                    rev = traceWS.Range("G" & traceRow).Text
+Else
+' Otherwise I compare to legacy D and append if different
+baselineRev = autoCILv4_CleanRev(masterWB.Sheets("CIL").Range("D" & rowNum).Text)
 
-                    ' I skip blanks / junk rev text
-                    If Not autoCILv2_IsValidRev(rev) Then
-                        traceRow = traceRow + 1
-                        GoTo ContinueScan
-                    End If
+If baselineRev <> autoCILv4_CleanRev(rev) Then
 
-                    ' If CIL E is empty, I write the first rev
-                    If Not autoCILv2_IsValidRev(masterWB.Sheets("CIL").Range("E" & rowNum).Text) Then
+If baselineRev = "" Then
+newRev = autoCILv4_CleanRev(rev)
+Else
+newRev = baselineRev & "," & autoCILv4_CleanRev(rev)
+End If
 
-                        masterWB.Sheets("CIL").Range("E" & rowNum).Value = autoCILv2_CleanRev(rev)
-                        autoCILv2_CenterCell masterWB.Sheets("CIL").Range("E" & rowNum)
+masterWB.Sheets("CIL").Range("E" & rowNum).Value = newRev
+autoCILv4_CenterCell masterWB.Sheets("CIL").Range("E" & rowNum)
+End If
+End If
+End If
 
-                    Else
-                        ' Otherwise I compare against legacy D and append if needed
-                        existingRev = autoCILv2_CleanRev(masterWB.Sheets("CIL").Range("D" & rowNum).Text)
-
-                        If existingRev <> autoCILv2_CleanRev(rev) Then
-
-                            If existingRev = "" Then
-                                newRev = autoCILv2_CleanRev(rev)
-                            Else
-                                newRev = existingRev & "," & autoCILv2_CleanRev(rev)
-                            End If
-
-                            masterWB.Sheets("CIL").Range("E" & rowNum).Value = newRev
-                            autoCILv2_CenterCell masterWB.Sheets("CIL").Range("E" & rowNum)
-                        End If
-                    End If
-
-                    Exit Do ' stop after first good match
-                End If
-
-                traceRow = traceRow + 1
-ContinueScan:
-            Loop
-        End If
-    Next rowNum
+End If
+Next rowNum
 
 End Sub
+
+
+' ============================================================
+' I build a dict of part → first valid rev per trace sheet.
+' This matches the old “stop at first good match” behavior.
+' ============================================================
+Private Function autoCILv4_BuildTraceDict_FirstValidRev(traceWS As Worksheet) As Object
+
+Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+Dim lastRow As Long
+Dim r As Long
+Dim part As String
+Dim rev As String
+
+lastRow = traceWS.Cells(traceWS.Rows.Count, "B").End(xlUp).Row
+
+For r = 5 To lastRow
+
+part = traceWS.Range("B" & r).Text
+rev = traceWS.Range("G" & r).Text
+
+If part <> "" And autoCILv4_IsValidRev(rev) Then
+If Not dict.Exists(part) Then
+dict.Add part, rev
+End If
+End If
+
+Next r
+
+Set autoCILv4_BuildTraceDict_FirstValidRev = dict
+
+End Function
 
 
 ' ============================================================
 ' I find where real CIL data starts.
 ' ============================================================
-Private Function autoCILv2_GetCILStartRow(masterWB As Workbook) As Long
+Private Function autoCILv4_GetCILStartRow(masterWB As Workbook) As Long
 
-    Dim ws As Worksheet, lastRow As Long, r As Long
-    Dim cellText As String
+Dim ws As Worksheet
+Dim lastRow As Long
+Dim r As Long
+Dim cellText As String
 
-    Set ws = masterWB.Sheets("CIL")
-    lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
+Set ws = masterWB.Sheets("CIL")
+lastRow = ws.Cells(ws.Rows.Count, "A").End(xlUp).Row
 
-    ' pass 1 — search header markers
-    For r = 1 To Application.Min(lastRow, 200)
-        cellText = UCase(Trim(ws.Range("A" & r).Text))
+' pass 1 — search header markers
+For r = 1 To Application.Min(lastRow, 200)
+cellText = UCase(Trim(ws.Range("A" & r).Text))
 
-        If cellText Like "*IDENTIFICATION NUMBER*" _
-        Or cellText Like "*PART NUMBER*" _
-        Or cellText Like "*ITEM NUMBER*" _
-        Or cellText Like "*CONFIGURATION IDENTIFICATION LIST*" Then
+If cellText Like "*IDENTIFICATION NUMBER*" _
+Or cellText Like "*PART NUMBER*" _
+Or cellText Like "*ITEM NUMBER*" _
+Or cellText Like "*CONFIGURATION IDENTIFICATION LIST*" Then
 
-            autoCILv2_GetCILStartRow = r + 1
-            Exit Function
-        End If
-    Next r
+autoCILv4_GetCILStartRow = r + 1
+Exit Function
+End If
+Next r
 
-    ' pass 2 — first row that looks like a PN
-    For r = 1 To lastRow
-        cellText = Trim(ws.Range("A" & r).Text)
-        If autoCILv2_IsPartNumber(cellText) Then
-            autoCILv2_GetCILStartRow = r
-            Exit Function
-        End If
-    Next r
+' pass 2 — first row that looks like a PN
+For r = 1 To lastRow
+If autoCILv4_IsPartNumber(Trim(ws.Range("A" & r).Text)) Then
+autoCILv4_GetCILStartRow = r
+Exit Function
+End If
+Next r
 
-    ' fallback
-    autoCILv2_GetCILStartRow = 12
+' fallback
+autoCILv4_GetCILStartRow = 12
 
 End Function
 
@@ -179,22 +212,22 @@ End Function
 ' ============================================================
 ' I decide if a string is a part number.
 ' ============================================================
-Private Function autoCILv2_IsPartNumber(s As String) As Boolean
+Private Function autoCILv4_IsPartNumber(s As String) As Boolean
 
-    Dim t As String: t = Trim(s)
-    If t = "" Then Exit Function
+Dim t As String: t = Trim(s)
+If t = "" Then Exit Function
 
-    ' I ignore obvious labels
-    If InStr(1, t, "PART NUMBER", vbTextCompare) > 0 Then Exit Function
-    If InStr(1, t, "IDENTIFICATION", vbTextCompare) > 0 Then Exit Function
-    If InStr(1, t, "CONFIGURATION", vbTextCompare) > 0 Then Exit Function
-    If InStr(1, t, "CONTRACT", vbTextCompare) > 0 Then Exit Function
-    If InStr(1, t, "PROGRAM", vbTextCompare) > 0 Then Exit Function
+' I ignore obvious labels
+If InStr(1, t, "PART NUMBER", vbTextCompare) > 0 Then Exit Function
+If InStr(1, t, "IDENTIFICATION", vbTextCompare) > 0 Then Exit Function
+If InStr(1, t, "CONFIGURATION", vbTextCompare) > 0 Then Exit Function
+If InStr(1, t, "CONTRACT", vbTextCompare) > 0 Then Exit Function
+If InStr(1, t, "PROGRAM", vbTextCompare) > 0 Then Exit Function
 
-    ' must contain digits and be long enough
-    If t Like "*[0-9]*" And Len(t) >= 4 Then
-        autoCILv2_IsPartNumber = True
-    End If
+' must contain digits and be long enough
+If t Like "*[0-9]*" And Len(t) >= 4 Then
+autoCILv4_IsPartNumber = True
+End If
 
 End Function
 
@@ -202,16 +235,16 @@ End Function
 ' ============================================================
 ' I detect trace-like sheets by checking B and G density.
 ' ============================================================
-Private Function autoCILv2_IsTraceLikeSheet(ws As Worksheet) As Boolean
+Private Function autoCILv4_IsTraceLikeSheet(ws As Worksheet) As Boolean
 
-    Dim bCount As Long, gCount As Long, r As Long
+Dim bCount As Long, gCount As Long, r As Long
 
-    For r = 5 To 20
-        If Trim(ws.Range("B" & r).Text) <> "" Then bCount = bCount + 1
-        If Trim(ws.Range("G" & r).Text) <> "" Then gCount = gCount + 1
-    Next r
+For r = 5 To 20
+If Trim(ws.Range("B" & r).Text) <> "" Then bCount = bCount + 1
+If Trim(ws.Range("G" & r).Text) <> "" Then gCount = gCount + 1
+Next r
 
-    autoCILv2_IsTraceLikeSheet = (bCount >= 3 And gCount >= 3)
+autoCILv4_IsTraceLikeSheet = (bCount >= 3 And gCount >= 3)
 
 End Function
 
@@ -219,25 +252,25 @@ End Function
 ' ============================================================
 ' I validate and clean revision strings.
 ' ============================================================
-Private Function autoCILv2_IsValidRev(s As String) As Boolean
+Private Function autoCILv4_IsValidRev(s As String) As Boolean
 
-    Dim t As String: t = LCase(Trim(s))
-    If t = "" Then Exit Function
-    If t = "no data available" Then Exit Function
-    If t = ",no data available" Then Exit Function
+Dim t As String: t = LCase(Trim(s))
+If t = "" Then Exit Function
+If t = "no data available" Then Exit Function
+If t = ",no data available" Then Exit Function
 
-    autoCILv2_IsValidRev = True
+autoCILv4_IsValidRev = True
 
 End Function
 
-Private Function autoCILv2_CleanRev(s As String) As String
+Private Function autoCILv4_CleanRev(s As String) As String
 
-    Dim t As String: t = Trim(s)
+Dim t As String: t = Trim(s)
 
-    If LCase(t) = "no data available" Then t = ""
-    If LCase(t) = ",no data available" Then t = ""
+If LCase(t) = "no data available" Then t = ""
+If LCase(t) = ",no data available" Then t = ""
 
-    autoCILv2_CleanRev = t
+autoCILv4_CleanRev = t
 
 End Function
 
@@ -245,54 +278,79 @@ End Function
 ' ============================================================
 ' small helpers
 ' ============================================================
-Private Sub autoCILv2_CenterCell(c As Range)
-    c.HorizontalAlignment = xlCenter
-    c.VerticalAlignment = xlCenter
+Private Sub autoCILv4_CenterCell(c As Range)
+c.HorizontalAlignment = xlCenter
+c.VerticalAlignment = xlCenter
 End Sub
 
-Private Function autoCILv2_SheetExists(wb As Workbook, sheetName As String) As Boolean
-    Dim ws As Worksheet
-    On Error Resume Next
-    Set ws = wb.Sheets(sheetName)
-    autoCILv2_SheetExists = Not ws Is Nothing
-    On Error GoTo 0
+Private Function autoCILv4_SheetExists(wb As Workbook, sheetName As String) As Boolean
+Dim ws As Worksheet
+On Error Resume Next
+Set ws = wb.Sheets(sheetName)
+autoCILv4_SheetExists = Not ws Is Nothing
+On Error GoTo 0
 End Function
 
 
 ' ============================================================
 ' folder / file scanning
+' v4 hardens "~$" lock files and de-dupes paths.
 ' ============================================================
-Private Function autoCILv2_SelectFolder() As String
+Private Function autoCILv4_SelectFolder() As String
 
-    Dim dialog As FileDialog
-    Set dialog = Application.FileDialog(msoFileDialogFolderPicker)
+Dim dialog As FileDialog
+Set dialog = Application.FileDialog(msoFileDialogFolderPicker)
 
-    dialog.Title = "Select Trace Root Folder"
-    dialog.AllowMultiSelect = False
+dialog.AllowMultiSelect = False
+dialog.Title = "Select Root Folder Containing Trace Files"
 
-    If dialog.Show <> -1 Then
-        autoCILv2_SelectFolder = ""
-    Else
-        autoCILv2_SelectFolder = dialog.SelectedItems(1)
-    End If
+If dialog.Show <> -1 Then
+autoCILv4_SelectFolder = ""
+Else
+autoCILv4_SelectFolder = dialog.SelectedItems(1)
+End If
 
 End Function
 
-Private Sub autoCILv2_GetAllExcelFiles(folderPath As String, fileList As Collection)
 
-    Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
-    Dim folder As Object: Set folder = fso.GetFolder(folderPath)
-    Dim file As Object, subFolder As Object
+Private Sub autoCILv4_GetAllExcelFiles(folderPath As String, fileList As Collection)
 
-    For Each file In folder.Files
-        Select Case LCase(fso.GetExtensionName(file.Name))
-            Case "xlsx", "xlsm", "xls"
-                fileList.Add file.Path
-        End Select
-    Next file
+Dim fso As Object: Set fso = CreateObject("Scripting.FileSystemObject")
+Dim folder As Object: Set folder = fso.GetFolder(folderPath)
+Dim file As Object, subFolder As Object
 
-    For Each subFolder In folder.SubFolders
-        autoCILv2_GetAllExcelFiles subFolder.Path, fileList
-    Next subFolder
+Dim ext As String, nm As String, realPath As String
+Dim seen As Object: Set seen = CreateObject("Scripting.Dictionary")
+
+For Each file In folder.Files
+nm = file.Name
+ext = LCase(fso.GetExtensionName(nm))
+
+Select Case ext
+Case "xlsx", "xlsm", "xls"
+
+If Left$(nm, 2) = "~$" Then
+' Lock stub → map to the real workbook name
+realPath = file.ParentFolder.Path & "\" & Mid$(nm, 3)
+If fso.FileExists(realPath) Then
+If Not seen.Exists(realPath) Then
+seen.Add realPath, True
+fileList.Add realPath
+End If
+End If
+
+Else
+If Not seen.Exists(file.Path) Then
+seen.Add file.Path, True
+fileList.Add file.Path
+End If
+End If
+
+End Select
+Next file
+
+For Each subFolder In folder.SubFolders
+autoCILv4_GetAllExcelFiles subFolder.Path, fileList
+Next subFolder
 
 End Sub
